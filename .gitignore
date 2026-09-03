@@ -1,6 +1,9 @@
 *.txt
 PRIDE_downloads/
+pride_lfq_mapping_results/
+Orthology/
 *.csv
+*.gz
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
