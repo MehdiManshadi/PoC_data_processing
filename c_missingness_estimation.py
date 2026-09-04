@@ -20,11 +20,25 @@ import os
 # SETTINGS
 # ============================================================
 
+PRIDE_ACCESSIONS = (
+    pd.read_excel(
+        "/Users/mehman/Projects/PoC_data_processing/Human_lfq_proteingroups_report.xlsx",
+        sheet_name=1,  # Second sheet
+        usecols=[0],   # First column
+        dtype=str,
+    )
+    .iloc[:, 0]
+    .dropna()
+    .str.strip()
+    .loc[lambda values: values.ne("")]
+    .drop_duplicates()
+    .tolist()
+)
+'''
 PRIDE_ACCESSIONS = [
-    "PXD044319",
+    "PXD010489"
 ]
-
-
+'''
 # Load the variables from the .env file
 load_dotenv()
 
@@ -229,7 +243,14 @@ def download_whole(url, output, session):
 
 
 def is_proteingroups_file(path):
-    return base(path).casefold() in {"proteingroups.txt", "proteingroups.txt.gz"}
+    filename = base(path)
+    return bool(
+        re.fullmatch(
+            r"proteingroups(?:[._-].*)?\.txt(?:\.gz)?",
+            filename,
+            flags=re.I,
+        )
+    )
 
 
 def protein_groups_address(url, member=None):

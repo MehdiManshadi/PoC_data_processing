@@ -2,8 +2,12 @@
 PRIDE_downloads/
 pride_lfq_mapping_results/
 Orthology/
+selected_features/
 *.csv
 *.gz
+*.xlsx
+*.csv
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

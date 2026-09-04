@@ -6,6 +6,7 @@ details live here.
 
 from __future__ import annotations
 
+from collections import defaultdict
 import gzip
 import hashlib
 import json
@@ -57,6 +58,33 @@ UNIPROT_RE = re.compile(
     r"[A-NR-Z][0-9][A-Z][A-Z0-9]{2}[0-9](?:[A-Z][A-Z0-9]{2}[0-9])?)"
 )
 SUPPORTED_AGGREGATIONS = {"mean", "median", "max", "min", "sum"}
+
+LFQ_SAMPLE_PREFIX_RE = re.compile(
+    r"^LFQ\s+intensity\s+",
+    re.IGNORECASE,
+)
+REPLICATE_SUFFIX_PATTERNS = [
+    (
+        re.compile(
+            r"^(.*?)(?:[_ .-]?(rep(?:licate)?|ex|run)"
+            r"[_-]?([A-Za-z0-9]+))$",
+            re.IGNORECASE,
+        ),
+        "labelled suffix",
+    ),
+    (
+        re.compile(r"^(.*?)[_ .-]([A-Za-z])$"),
+        "letter suffix",
+    ),
+    (
+        re.compile(r"^(.*?)[_ .-](\d+)$"),
+        "numeric suffix",
+    ),
+    (
+        re.compile(r"^(.*?)([A-Da-d])$"),
+        "attached A-D suffix",
+    ),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -841,6 +869,128 @@ def available_genes(frame: pd.DataFrame, mask=None) -> set[str]:
     ) - {""}
 
 
+def _split_replicate_suffix(sample_name: str) -> tuple[str, str, str]:
+    """Split a conservative final replicate suffix from one LFQ sample name."""
+    for pattern, rule in REPLICATE_SUFFIX_PATTERNS:
+        match = pattern.match(sample_name)
+        if not match:
+            continue
+        stem = match.group(1).rstrip("_ .-")
+        suffix = sample_name[len(match.group(1)) :].lstrip("_ .-")
+        if stem:
+            return stem, suffix, rule
+    return sample_name, "", "no recognized suffix"
+
+
+def suggest_lfq_groups(
+    lfq_catalog: pd.DataFrame,
+    *,
+    include_singletons: bool = True,
+) -> tuple[dict[str, list[str]], dict[str, str], pd.DataFrame]:
+    """Suggest LFQ groups from shared stems and final replicate suffixes.
+
+    Examples include ``CL_A2780_A/B/C``, ``PC_FTEC_1216/1218/1229``,
+    ``TU_LOV_1/2/4/5``, and ``DeltacysA/B/C``. Internal identifiers such as
+    ``A2780``, ``CP70``, ``C13``, and ``OVCAR3`` are retained. A shared stem is
+    accepted only when at least two distinct suffixes support it.
+    """
+    required = {"table_id", "LFQ_column_name"}
+    missing = required.difference(lfq_catalog.columns)
+    if missing:
+        raise ValueError(
+            "lfq_catalog is missing required column(s): "
+            f"{sorted(missing)}"
+        )
+
+    catalog = (
+        lfq_catalog[["table_id", "LFQ_column_name"]]
+        .dropna()
+        .drop_duplicates()
+        .copy()
+    )
+    catalog["table_id"] = catalog["table_id"].astype(str)
+    catalog["LFQ_column_name"] = catalog["LFQ_column_name"].astype(str)
+
+    suggestions: dict[str, list[str]] = {}
+    group_tables: dict[str, str] = {}
+    summary_rows: list[dict[str, object]] = []
+    multiple_tables = catalog["table_id"].nunique() > 1
+
+    for table_id, table_catalog in catalog.groupby("table_id", sort=False):
+        records: list[dict[str, str]] = []
+        for column in table_catalog["LFQ_column_name"]:
+            sample = LFQ_SAMPLE_PREFIX_RE.sub("", column).strip()
+            stem, suffix, rule = _split_replicate_suffix(sample)
+            records.append(
+                {
+                    "column": column,
+                    "sample": sample,
+                    "stem": stem,
+                    "suffix": suffix,
+                    "rule": rule,
+                }
+            )
+
+        by_stem: defaultdict[str, list[dict[str, str]]] = defaultdict(list)
+        for record in records:
+            by_stem[record["stem"]].append(record)
+
+        assigned: set[str] = set()
+        proposed: list[tuple[str, list[dict[str, str]], str]] = []
+        for stem, members in by_stem.items():
+            distinct_suffixes = {
+                member["suffix"].casefold()
+                for member in members
+                if member["suffix"]
+            }
+            if len(members) >= 2 and len(distinct_suffixes) >= 2:
+                proposed.append((stem, members, members[0]["rule"]))
+                assigned.update(member["column"] for member in members)
+
+        if include_singletons:
+            for record in records:
+                if record["column"] not in assigned:
+                    proposed.append(
+                        (record["sample"], [record], "singleton / review")
+                    )
+
+        for base_name, members, rule in proposed:
+            group_name = (
+                f"{table_id}__{base_name}" if multiple_tables else base_name
+            )
+            original_name = group_name
+            counter = 2
+            while group_name in suggestions:
+                group_name = f"{original_name}__{counter}"
+                counter += 1
+
+            suggestions[group_name] = [
+                member["column"] for member in members
+            ]
+            group_tables[group_name] = table_id
+            summary_rows.append(
+                {
+                    "suggested_group": group_name,
+                    "n_LFQ_columns": len(members),
+                    "detection_rule": rule,
+                    "samples": "; ".join(
+                        member["sample"] for member in members
+                    ),
+                }
+            )
+
+    preview = pd.DataFrame(
+        summary_rows,
+        columns=[
+            "suggested_group",
+            "n_LFQ_columns",
+            "detection_rule",
+            "samples",
+        ],
+    )
+    return suggestions, group_tables, preview
+
+
 def _validate_aggregation(method: str, label: str) -> None:
     if method not in SUPPORTED_AGGREGATIONS:
         raise ValueError(f"{label} must be one of {sorted(SUPPORTED_AGGREGATIONS)}")
@@ -1180,6 +1330,24 @@ def _display(frame: pd.DataFrame) -> None:
         print(frame.to_string(index=False))
 
 
+def suggest_groups_and_show(
+    lfq_catalog: pd.DataFrame,
+    *,
+    include_singletons: bool = True,
+) -> tuple[dict[str, list[str]], dict[str, str], pd.DataFrame]:
+    """Notebook-facing wrapper: suggest LFQ groups and show the preview."""
+    groups, group_tables, preview = suggest_lfq_groups(
+        lfq_catalog,
+        include_singletons=include_singletons,
+    )
+    _display(preview)
+    print(
+        f"Suggested {len(groups)} group(s) from "
+        f"{sum(len(columns) for columns in groups.values())} LFQ columns."
+    )
+    return groups, group_tables, preview
+
+
 def download_and_show(
     dataset: Mapping[str, object],
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -1261,5 +1429,7 @@ __all__ = [
     "resolve_group_tables",
     "save_uniprot_cache",
     "session_with_retries",
+    "suggest_groups_and_show",
+    "suggest_lfq_groups",
     "uniprot_ids",
 ]
