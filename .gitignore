@@ -11,6 +11,8 @@ selected_features/
 *.gz
 *.xlsx
 *.csv
+f_model_training.py
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
