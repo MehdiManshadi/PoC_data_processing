@@ -1,3 +1,21 @@
+"""Download PRIDE proteinGroups tables and report coverage without reference lists.
+
+Set INPUT_FILE to the PRIDE finder's Excel or CSV report (column: accession).
+The existing downloader discovers all proteinGroups tables for each accession.
+Gene extraction and UniProt fallback are unchanged. A row passes only when its
+LFQ values are non-zero and non-missing in strictly more than 10% of all LFQ
+columns. Coverage counts unique gene names in passing rows, case-insensitively.
+
+Writes dataset_coverage_report.xlsx with dataset_coverage and table_coverage
+sheets. The dataset count is the union of qualifying genes across its tables;
+failed tables have blank counts. A mix of successful and failed table analyses
+is marked partial.
+Both sheets retain input organisms, study year (from publication_date), paper
+title/link and tissue information, plus the LFQ column names for each record.
+
+Dependencies: pandas, openpyxl, requests, remotezip, python-dotenv.
+"""
+
 import gzip
 import hashlib
 import re
@@ -6,6 +24,7 @@ import tempfile
 import time
 from pathlib import Path, PurePosixPath
 from zipfile import ZipFile
+from urllib.parse import unquote, urlsplit
 
 import pandas as pd
 import requests
@@ -20,42 +39,23 @@ import os
 # SETTINGS
 # ============================================================
 
-PRIDE_ACCESSIONS = (
-    pd.read_excel(
-        "/Users/mehman/Projects/PoC_data_processing/Human_lfq_proteingroups_report.xlsx",
-        sheet_name=1,  # Second sheet
-        usecols=[0],   # First column
-        dtype=str,
-    )
-    .iloc[:, 0]
-    .dropna()
-    .str.strip()
-    .loc[lambda values: values.ne("")]
-    .drop_duplicates()
-    .tolist()
-)
-'''
-PRIDE_ACCESSIONS = [
-    "PXD010489"
-]
-'''
-# Load the variables from the .env file
 load_dotenv()
-
-# Read the strings from environment and wrap them in Path()
-OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR"))
-
-HYPERGLYCEMIA_FEATURES_FILE = Path(os.getenv("HYPERGLYCEMIA_FEATURES_FILE"))
-
-MITOCHONDRIAL_MYOPATHY_FEATURES_FILE = Path(os.getenv("MITOCHONDRIAL_MYOPATHY_FEATURES_FILE"))
+DELETE_DOWNLOADED_FILES = False
+INPUT_FILE = Path("/Users/mehman/Projects/PoC_data_processing/zebrafish_test.csv")
+INPUT_SHEET = 0  # First Excel sheet; change to a sheet name or zero-based index.
+OUTPUT_DIR = Path("/Users/mehman/Projects/PoC_data_processing/pp")
 
 SAVE_PROCESSED_TABLES = True
-FEATURE_PRESENCE_THRESHOLD = 0.10
+PRESENCE_THRESHOLD = 0.10
 MAX_FULL_ZIP_DOWNLOAD_GB = 20
 REQUEST_TIMEOUT = 300
 
 PRIDE_API = "https://www.ebi.ac.uk/pride/ws/archive/v3"
 UNIPROT_API = "https://rest.uniprot.org"
+
+METADATA_COLUMNS = [
+    "organisms", "study_year", "publication_url", "publication_title", "combined_tissues",
+]
 
 GENE_ALIASES = {
     "gene names", "gene name", "gene", "genes",
@@ -75,16 +75,70 @@ UNIPROT_RE = re.compile(
 # BASIC HELPERS
 # ============================================================
 
+def read_input_report(path, sheet_name=0):
+    path = Path(path)
+    if path.suffix.casefold() == ".csv":
+        report = pd.read_csv(path, dtype=str, encoding="utf-8-sig")
+    else:
+        report = pd.read_excel(path, sheet_name=sheet_name, dtype=str)
+    columns = {str(column).strip().casefold(): column for column in report.columns}
+    if "accession" not in columns:
+        raise ValueError("Input must be a PRIDE finder report with an 'accession' column.")
+    values = report[columns["accession"]].dropna().str.strip().str.upper()
+    values = values[values.ne("")].drop_duplicates()
+    invalid = values[~values.str.fullmatch(r"PXD\d+")].tolist()
+    if invalid:
+        raise ValueError(f"Invalid PRIDE accession(s): {', '.join(invalid)}")
+    # The finder has one metadata row per accession; retain the first occurrence.
+    report = report.rename(columns={value: key for key, value in columns.items()}).fillna("")
+    report["accession"] = report["accession"].str.strip().str.upper()
+    metadata = {}
+    for _, row in report.drop_duplicates("accession").iterrows():
+        accession = row["accession"]
+        if not accession:
+            continue
+        year = re.search(r"\b(\d{4})\b", str(row.get("publication_date", "")))
+        tissues = row.get("combined_tissues", "") or "; ".join(dict.fromkeys(
+            value for value in (
+                row.get("pride_structured_tissues", ""),
+                row.get("omicsdi_structured_tissues", ""),
+                row.get("sdrf_tissues", ""),
+            ) if value
+        ))
+        metadata[accession] = {
+            "organisms": row.get("organisms", ""),
+            "study_year": year.group(1) if year else "",
+            "publication_url": row.get("publication_url", ""),
+            "publication_title": row.get("publication_title", ""),
+            "combined_tissues": tissues,
+        }
+    return values.tolist(), metadata
+
+
 def session_with_retries():
     retry = Retry(
-        total=3,
-        backoff_factor=1,
-        status_forcelist=(429, 500, 502, 503, 504),
+        total=4,                    # initial request + up to 4 retries
+        connect=4,
+        read=4,
+        status=4,
+        backoff_factor=5,           # progressively longer waits
+        status_forcelist=(403, 429, 500, 502, 503, 504),
         allowed_methods={"GET", "HEAD", "POST"},
+        respect_retry_after_header=True,
+        raise_on_status=False,
     )
-    s = requests.Session()
-    s.mount("https://", HTTPAdapter(max_retries=retry))
-    return s
+
+    session = requests.Session()
+
+    session.headers.update({
+        "User-Agent": (
+            "PoC-data-processing/1.0 "
+            "(https://github.com/MehdiManshadi/PoC_data_processing)"
+        )
+    })
+
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    return session
 
 
 def norm(x):
@@ -163,10 +217,6 @@ def file_size(record):
         return 0
 
 
-def parse_header(line):
-    return line.decode("utf-8-sig", errors="replace").rstrip("\r\n").split("\t")
-
-
 def gene_sources(columns):
     normalized = {norm(c): c for c in columns}
 
@@ -192,31 +242,9 @@ def gene_sources(columns):
     return gene_col, fasta_cols, majority_col, lfq_cols
 
 
-def valid_header(header):
-    gene_col, fasta_cols, majority_col, lfq_cols = gene_sources(header)
-    return bool((gene_col or fasta_cols or majority_col) and lfq_cols), len(lfq_cols)
-
-
 # ============================================================
 # FIND / DOWNLOAD proteinGroups.txt
 # ============================================================
-
-def read_direct_header(url, session, gz=False):
-    with session.get(url, stream=True, timeout=REQUEST_TIMEOUT) as r:
-        r.raise_for_status()
-        r.raw.decode_content = True
-        if gz:
-            with gzip.GzipFile(fileobj=r.raw) as f:
-                return parse_header(f.readline(4 * 1024 * 1024))
-        return parse_header(r.raw.readline(4 * 1024 * 1024))
-
-
-def read_zip_header(archive, member):
-    with archive.open(member) as f:
-        if member.lower().endswith(".gz"):
-            with gzip.GzipFile(fileobj=f) as g:
-                return parse_header(g.readline(4 * 1024 * 1024))
-        return parse_header(f.readline(4 * 1024 * 1024))
 
 
 def copy_stream(source, destination):
@@ -260,22 +288,33 @@ def protein_groups_address(url, member=None):
     return f"{url}!/{str(member).lstrip('/')}"
 
 
-def protein_groups_output_path(output_dir, accession, address, archive_name, member=None):
-    """Create a readable, collision-safe local name for one proteinGroups table."""
-    if member is None:
-        label = "direct"
+def protein_groups_output_path(output_dir, accession, address):
+    """Keep original filename, but use a unique folder to prevent overwriting."""
+    url, separator, member = address.partition("!/")
+
+    if separator:
+        # File inside ZIP
+        filename = base(member)
     else:
-        archive_label = re.sub(r"\.zip$", "", base(archive_name), flags=re.I)
-        member_parent = str(PurePosixPath(member).parent)
-        label = archive_label if member_parent == "." else f"{archive_label}_{member_parent}"
+        # Direct file
+        filename = base(unquote(urlsplit(url).path))
 
-    label = re.sub(r"[^A-Za-z0-9._-]+", "_", label).strip("._-") or "source"
-    label = label[:80]
-    digest = hashlib.sha256(address.encode("utf-8")).hexdigest()[:12]
+    # We decompress .gz files
+    if filename.lower().endswith(".gz"):
+        filename = filename[:-3]
 
-    destination_dir = Path(output_dir) / accession / "proteinGroups_files"
+    # Unique folder for this specific source
+    source_id = hashlib.sha256(address.encode("utf-8")).hexdigest()[:12]
+
+    destination_dir = (
+        Path(output_dir)
+        / accession
+        / "proteinGroups_files"
+        / source_id
+    )
     destination_dir.mkdir(parents=True, exist_ok=True)
-    return destination_dir / f"{accession}__{label}__{digest}.txt"
+
+    return destination_dir / filename
 
 
 def extracted_source(address, local_file, archive_name, member=None, error=None):
@@ -314,8 +353,6 @@ def extract_all_zip_members(
             output_dir,
             accession,
             address,
-            archive_name,
-            member,
         )
 
         try:
@@ -370,7 +407,6 @@ def find_and_download_all_proteingroups(accession, output_dir, session):
                 output_dir,
                 accession,
                 address,
-                record_name,
             )
 
             with session.get(url, stream=True, timeout=REQUEST_TIMEOUT) as r:
@@ -639,211 +675,135 @@ def create_presence_dataframe(file_path, session, uniprot_cache):
 
 
 # ============================================================
-# FEATURE MISSINGNESS
+# COVERAGE
 # ============================================================
 
-def read_feature_genes(path):
-    genes = []
-    for line in Path(path).read_text(encoding="utf-8-sig").splitlines():
-        line = line.split("#", 1)[0].strip()
-        if not line:
-            continue
-        for gene in re.split(r"[;,\t]+", line):
-            gene = gene.strip()
-            if gene and gene.casefold() not in {
-                "gene", "genes", "gene name", "gene names",
-                "feature", "features", "gene symbol", "gene symbols",
-            }:
-                genes.append(gene.upper())
-    return list(dict.fromkeys(genes))
-
-
-def feature_missingness(df, feature_genes):
-    # Preserves the original script's matching logic:
-    # any gene appearing in "Gene names" is considered found, provided that
-    # its row is non-zero in at least 10% of all LFQ columns in this table.
-    present = set(
-        df.loc[df["Presence"] > FEATURE_PRESENCE_THRESHOLD, "Gene names"]
+def passing_genes(df):
+    genes = set(
+        df.loc[df["Presence"] > PRESENCE_THRESHOLD, "Gene names"]
         .dropna()
         .str.split(";")
         .explode()
         .str.strip()
         .str.upper()
     )
+    genes.discard("")
+    return genes
 
-    target = set(g.upper() for g in feature_genes)
-    found = target & present
-    missing = target - found
-
-    return {
-        "total_genes": len(target),
-        "found_genes": len(found),
-        "missing_genes": len(missing),
-        "missingness_percent": 100 * len(missing) / len(target),
-        "found_gene_names": ";".join(sorted(found)),
-        "missing_gene_names": ";".join(sorted(missing)),
-    }
-
-
-# ============================================================
-# RUN
-# ============================================================
 
 def main():
+    accessions, metadata = read_input_report(INPUT_FILE, INPUT_SHEET)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    hyper = read_feature_genes(HYPERGLYCEMIA_FEATURES_FILE)
-    mito = read_feature_genes(MITOCHONDRIAL_MYOPATHY_FEATURES_FILE)
-
     session = session_with_retries()
-    uniprot_cache = {}
-    # Nested structure: dataframes[accession][proteinGroups_address] = dataframe
-    # This preserves dataset-level access while allowing multiple tables per dataset.
-    dataframes = {}
-    results = []
+    uniprot_cache, dataframes = {}, {}
+    dataset_rows, table_rows = [], []
 
     try:
-        for n, accession in enumerate(dict.fromkeys(PRIDE_ACCESSIONS), 1):
-            accession = accession.strip().upper()
-            print(f"[{n}/{len(PRIDE_ACCESSIONS)}] {accession}")
-
+        for number, accession in enumerate(accessions, 1):
+            print(f"[{number}/{len(accessions)}] {accession}")
+            dataframes[accession] = {}
+            dataset_genes, rows = set(), []
+            dataset_lfq_names = []
             try:
-                sources = find_and_download_all_proteingroups(
-                    accession,
-                    OUTPUT_DIR,
-                    session,
-                )
-                dataframes.setdefault(accession, {})
-                print(f"  Found {len(sources)} unique proteinGroups table(s).")
+                sources = find_and_download_all_proteingroups(accession, OUTPUT_DIR, session)
+            except Exception as error:
+                # Keep a failed dataset in the report rather than omitting it.
+                sources = [extracted_source("", None, "", error=error)]
 
-                for source_number, source in enumerate(sources, 1):
-                    address = source["proteinGroups_address"]
-                    raw_file = source["local_file"]
-
-                    result = {
-                        # Keep these as the first two report columns. Together
-                        # they uniquely identify every analysed table.
-                        "PRIDE_accession": accession,
-                        "proteinGroups_address": address,
-                        "downloaded_file": raw_file,
-                        "source_archive": source["archive_name"],
-                        "source_member": source["archive_member"],
-                        "processed_file": "",
-                        "analysis_status": "failed",
-                        "analysis_error": source["download_error"],
-                    }
-
-                    if source["download_error"]:
-                        results.append(result)
-                        print(
-                            f"  [{source_number}/{len(sources)}] FAILED to download "
-                            f"{address}: {source['download_error']}"
-                        )
-                        continue
-
+            for source in sources:
+                address = source["proteinGroups_address"]
+                raw_file = source["local_file"]
+                row = {
+                    "accession": accession,
+                    "protein_groups_url": address,
+                    "total_measured_genes": pd.NA,
+                    "downloaded_file": raw_file,
+                    "processed_file": "",
+                    "analysis_status": "failed",
+                    "analysis_error": source["download_error"],
+                    **metadata[accession],
+                    "lfq_column_names": "",
+                }
+                if not source["download_error"]:
                     try:
-                        df = create_presence_dataframe(
-                            raw_file,
-                            session,
-                            uniprot_cache,
-                        )
+                        header = pd.read_csv(raw_file, sep="\t", nrows=0).columns
+                        lfq_names = [
+                            LFQ_RE.sub("", str(c).strip()).strip()
+                            for c in header
+                            if LFQ_RE.match(str(c).strip())]
+                        row["lfq_column_names"] = "; ".join(lfq_names)
+                        dataset_lfq_names.extend(lfq_names)
+                        df = create_presence_dataframe(raw_file, session, uniprot_cache)
+                        genes = passing_genes(df)
                         dataframes[accession][address] = df
-
                         if SAVE_PROCESSED_TABLES:
                             processed_dir = OUTPUT_DIR / accession / "processed_tables"
                             processed_dir.mkdir(parents=True, exist_ok=True)
-                            processed_file = (
-                                processed_dir
-                                / f"{Path(raw_file).stem}_processed.txt"
-                            )
+                            processed_file = processed_dir / f"{Path(raw_file).stem}_processed.txt"
                             df.to_csv(processed_file, sep="\t", index=False)
-                            result["processed_file"] = str(processed_file)
-
-                        h = feature_missingness(df, hyper)
-                        m = feature_missingness(df, mito)
-
-                        result.update({
+                            row["processed_file"] = str(processed_file)
+                        dataset_genes.update(genes)
+                        row.update({
+                            "total_measured_genes": len(genes),
                             "analysis_status": "success",
                             "analysis_error": "",
-
-                            "hyperglycemia_total_genes": h["total_genes"],
-                            "hyperglycemia_found_genes": h["found_genes"],
-                            "hyperglycemia_missing_genes": h["missing_genes"],
-                            "hyperglycemia_missingness_percent": h["missingness_percent"],
-                            "hyperglycemia_found_gene_names": h["found_gene_names"],
-                            "hyperglycemia_missing_gene_names": h["missing_gene_names"],
-
-                            "mitochondrial_myopathy_total_genes": m["total_genes"],
-                            "mitochondrial_myopathy_found_genes": m["found_genes"],
-                            "mitochondrial_myopathy_missing_genes": m["missing_genes"],
-                            "mitochondrial_myopathy_missingness_percent": m["missingness_percent"],
-                            "mitochondrial_myopathy_found_gene_names": m["found_gene_names"],
-                            "mitochondrial_myopathy_missing_gene_names": m["missing_gene_names"],
                         })
-                        results.append(result)
+                        print(f"  {Path(raw_file).name}: {len(genes)} genes passed >10%")
+                    except Exception as error:
+                        row["analysis_error"] = str(error)
+                if row["analysis_status"] == "failed":
+                    print(f"  FAILED {address}: {row['analysis_error']}")
+                rows.append(row)
 
-                        print(
-                            f"  [{source_number}/{len(sources)}] "
-                            f"Hyperglycemia: {h['missingness_percent']:.2f}% | "
-                            f"Mitochondrial: {m['missingness_percent']:.2f}%"
-                        )
-
-                    except Exception as e:
-                        result["analysis_error"] = str(e)
-                        results.append(result)
-                        print(
-                            f"  [{source_number}/{len(sources)}] FAILED analysis "
-                            f"for {address}: {e}"
-                        )
-
-            except Exception as e:
-                print(f"  FAILED: {e}")
-
+            table_rows.extend(rows)
+            successful = sum(row["analysis_status"] == "success" for row in rows)
+            status = "success" if successful == len(rows) else "partial"
+            if not successful:
+                status = "failed"
+            dataset_rows.append({
+                "accession": accession,
+                "total_measured_genes": len(dataset_genes) if successful else pd.NA,
+                "analysis_status": status,
+                **metadata[accession],
+                "lfq_column_names": "; ".join(dict.fromkeys(dataset_lfq_names)),
+                "analysis_error": "; ".join(dict.fromkeys(
+                    row["analysis_error"] for row in rows if row["analysis_error"]
+                )),
+            })
     finally:
         session.close()
 
-    report_columns = [
-        "PRIDE_accession",
-        "proteinGroups_address",
-        "downloaded_file",
-        "source_archive",
-        "source_member",
-        "processed_file",
-        "analysis_status",
-        "analysis_error",
-        "hyperglycemia_total_genes",
-        "hyperglycemia_found_genes",
-        "hyperglycemia_missing_genes",
-        "hyperglycemia_missingness_percent",
-        "hyperglycemia_found_gene_names",
-        "hyperglycemia_missing_gene_names",
-        "mitochondrial_myopathy_total_genes",
-        "mitochondrial_myopathy_found_genes",
-        "mitochondrial_myopathy_missing_genes",
-        "mitochondrial_myopathy_missingness_percent",
-        "mitochondrial_myopathy_found_gene_names",
-        "mitochondrial_myopathy_missing_gene_names",
-    ]
-    dataset_missingness_scores = pd.DataFrame(results).reindex(columns=report_columns)
+    table_coverage = pd.DataFrame(table_rows, columns=[
+            "accession", "protein_groups_url", "total_measured_genes",
+            "downloaded_file", "processed_file", "analysis_status", "analysis_error",
+            *METADATA_COLUMNS, "lfq_column_names",
+        ])
+    dataset_coverage = pd.DataFrame(dataset_rows, columns=[
+        "accession", "total_measured_genes", "analysis_status", "analysis_error",
+        *METADATA_COLUMNS, "lfq_column_names",
+    ])
+    
+    if table_coverage.duplicated(["accession", "protein_groups_url"]).any():
+        raise RuntimeError("Duplicate dataset/proteinGroups address pairs in the report.")
+    for report in (dataset_coverage, table_coverage):
+        report["total_measured_genes"] = report["total_measured_genes"].astype("Int64")
+        report_file = OUTPUT_DIR / "dataset_coverage_report.xlsx"
+    with pd.ExcelWriter(report_file, engine="openpyxl") as writer:
+        table_coverage.to_excel(writer, sheet_name="table_coverage", index=False)
+        dataset_coverage.to_excel(writer, sheet_name="dataset_coverage", index=False)
 
-    # Discovery already de-duplicates addresses. This check protects the report
-    # invariant if PRIDE ever returns the same source through multiple records.
-    duplicate_rows = dataset_missingness_scores.duplicated(
-        subset=["PRIDE_accession", "proteinGroups_address"],
-        keep=False,
-    )
-    if duplicate_rows.any():
-        raise RuntimeError(
-            "Duplicate dataset/proteinGroups address pairs found in the report."
-        )
+    print(f"Saved {report_file}")
 
-    dataset_missingness_scores.to_csv(
-        OUTPUT_DIR / "dataset_missingness_scores.csv",
-        index=False,
-    )
+    # Delete all downloaded/processed files after analysis
+    if DELETE_DOWNLOADED_FILES:
+        for accession in accessions:
+            accession_dir = OUTPUT_DIR / accession
+            if accession_dir.exists():
+                shutil.rmtree(accession_dir)
 
-    return dataframes, dataset_missingness_scores
-
+        print("Deleted all downloaded files.")
+        
+    return dataframes, dataset_coverage
 
 if __name__ == "__main__":
-    dataframes, dataset_missingness_scores = main()
+    dataframes, dataset_coverage = main()

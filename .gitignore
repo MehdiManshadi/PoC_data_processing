@@ -1,8 +1,12 @@
 *.txt
 PRIDE_downloads/
 pride_lfq_mapping_results/
+gene_orthology/
+isoforms/
 Orthology/
+CLAUDE.md
 selected_features/
+/scripts/*/
 *.csv
 *.gz
 *.xlsx

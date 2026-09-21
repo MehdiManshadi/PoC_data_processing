@@ -1,53 +1,26 @@
 #!/usr/bin/env python3
-"""Find human or zebrafish PRIDE datasets with an exact proteinGroups.txt file.
+"""Find human, mouse, or zebrafish PRIDE datasets with proteinGroups.txt.
 
-Pipeline
---------
-1. Discover human or zebrafish proteomics records through OmicsDI.
-2. Keep only PRIDE datasets whose public PRIDE manifest contains the exact
-   canonical MaxQuant basename ``proteinGroups.txt`` (case-sensitive), either
-   as a direct file or inside a public ZIP archive. ZIP files are inspected
-   remotely through their central directory; they are never downloaded in full.
-3. Enrich each retained dataset with structured OmicsDI, PRIDE, and SDRF
-   metadata.
-4. Retrieve a related publication abstract from Europe PMC when a PMID or DOI
-   is available.
-5. Text-mine tissue/biofluid names and explicit sample/participant/replicate
-   counts from repository text and the publication abstract.
-6. Read only the beginning of proteinGroups.txt (also when it is stored in a
-   ZIP) to check whether actual ``LFQ intensity ...`` columns exist and count
-   the quantitative profiles.
-7. Conservatively compare LFQ sample labels with PRIDE manifest file basenames
-   and report whether all, some, or none are directly mappable.
+Search OmicsDI, verify the exact proteinGroups.txt basename directly or inside
+public ZIP archives, and optionally require LFQ intensity columns. Tissue values
+come only from structured PRIDE, OmicsDI, and SDRF metadata. The CSV includes
+metadata, file URLs, dataset titles/links, and related publication titles/links.
+Missing tissue or publication information is left empty.
 
-The CSV keeps evidence and provenance separate. A filename match proves that
-the public PRIDE manifest exposes proteinGroups.txt; it does not by itself
-prove that the table contains LFQ columns or reveal the biological sample
-count. Those questions are reported separately.
+Full datasets are not downloaded or saved: only metadata, ZIP directories,
+and bounded table prefixes are read remotely. Requires Python 3.10+; standard
+library only.
 
-Requires Python 3.10+ and uses only the standard library.
+Examples::
 
-Quick test (targeted discovery; stops after 5 verified datasets)::
+    python b_omicsdi_pride_dataset_finder.py --organism mouse \
+        --require-lfq-columns --output mouse_lfq_report.csv
 
-    python omicsdi_pride_proteingroups.py --test --test-limit 5 \
-        --output human_proteingroups_test.csv
+    python b_omicsdi_pride_dataset_finder.py --organism zebrafish --test \
+        --test-limit 5 --output zebrafish_test.csv
 
-Zebrafish LFQ discovery::
-
-    python omicsdi_pride_proteingroups.py --organism zebrafish \
-        --require-lfq-columns --output zebrafish_lfq_report.csv
-
-Full discovery::
-
-    python omicsdi_pride_proteingroups.py \
-        --max-candidates 5000 \
-        --output human_proteingroups_report.csv
-
-Strict LFQ-only output::
-
-    python omicsdi_pride_proteingroups.py \
-        --require-lfq-columns \
-        --output human_lfq_proteingroups_report.csv
+Human is the default organism. The default report is
+<organism>_proteingroups_report.csv.
 """
 
 from __future__ import annotations
@@ -90,10 +63,15 @@ ORGANISM_CONFIG: dict[str, dict[str, str]] = {
     "zebrafish": {
         "label": "Danio rerio (zebrafish)",
         "query": '(zebrafish OR "Danio rerio" OR "NCBITaxon:7955") '
-        'AND omics_type:"Proteomics" AND repository:"PRIDE"',
+                 'AND omics_type:"Proteomics" AND repository:"PRIDE"',
+    },
+    "mouse": {
+        "label": "Mus musculus (mouse)",
+        "query": '("Mus musculus" OR mouse OR mice OR murine OR "NCBITaxon:10090") '
+                 'AND omics_type:"Proteomics" AND repository:"PRIDE"',
     },
 }
-USER_AGENT = "pride-proteingroups-discovery/1.1"
+USER_AGENT = "pride-proteingroups-discovery/1.2"
 
 CSV_FIELDS = [
     "accession",
@@ -111,173 +89,16 @@ CSV_FIELDS = [
     "protein_groups_file_size_mb",
     "protein_groups_url",
     "lfq_columns_detected",
-    "lfq_column_count",
-    "lfq_sample_names",
-    "lfq_names_mappable_to_pride_files",
-    "lfq_names_mapped_count",
-    "lfq_names_unmapped_count",
-    "lfq_names_unmapped",
-    "lfq_name_file_matches",
-    "ordinary_intensity_column_count",
     "pride_structured_tissues",
     "omicsdi_structured_tissues",
     "sdrf_tissues",
-    "text_mined_tissues",
     "combined_tissues",
-    "tissue_count",
-    "sdrf_row_count",
-    "sdrf_unique_source_count",
-    "sdrf_unique_sample_count",
-    "sample_count_estimate",
-    "sample_count_basis",
-    "sample_count_confidence",
-    "sample_count_hints",
-    "replicate_count_hints",
-    "sample_evidence_pride",
-    "sample_evidence_abstract",
-    "tissue_evidence_sources",
     "pmid",
     "doi",
     "publication_title",
     "publication_url",
     "pride_dataset_url",
     "omicsdi_dataset_url",
-]
-
-
-# Canonical tissue/biofluid name -> expressions commonly used in metadata.
-# Longer, specific terms are intentionally retained alongside broad coverage.
-TISSUE_TERMS: dict[str, tuple[str, ...]] = {
-    "adipose tissue": ("adipose tissue", "adipose", "fat tissue"),
-    "visceral adipose tissue": ("visceral adipose tissue", "visceral fat", "vat"),
-    "subcutaneous adipose tissue": (
-        "subcutaneous adipose tissue",
-        "subcutaneous fat",
-        "sat",
-    ),
-    "skeletal muscle": ("skeletal muscle", "musculus skeletal muscle"),
-    "cardiac muscle": ("cardiac muscle", "myocardium", "myocardial tissue"),
-    "muscle": ("muscle tissue", "muscle"),
-    "serum": ("serum",),
-    "plasma": ("blood plasma", "plasma"),
-    "whole blood": ("whole blood",),
-    "blood": ("peripheral blood", "blood"),
-    "pbmc": ("peripheral blood mononuclear cells", "pbmcs", "pbmc"),
-    "bone marrow": ("bone marrow",),
-    "cerebrospinal fluid": ("cerebrospinal fluid", "csf"),
-    "urine": ("urine", "urinary proteome"),
-    "saliva": ("saliva", "salivary fluid"),
-    "breast": ("breast tissue", "mammary gland", "breast"),
-    "liver": ("liver tissue", "liver", "hepatic tissue"),
-    "brain": ("brain tissue", "brain"),
-    "cerebral cortex": ("cerebral cortex", "brain cortex"),
-    "hippocampus": ("hippocampus", "hippocampal tissue"),
-    "cerebellum": ("cerebellum", "cerebellar tissue"),
-    "heart": ("heart tissue", "heart"),
-    "kidney": ("kidney tissue", "kidney", "renal tissue"),
-    "lung": ("lung tissue", "lung", "pulmonary tissue"),
-    "pancreas": ("pancreatic tissue", "pancreas"),
-    "pancreatic islet": ("pancreatic islets", "pancreatic islet", "islets of langerhans"),
-    "colon": ("colon tissue", "colon", "colonic tissue"),
-    "rectum": ("rectal tissue", "rectum"),
-    "small intestine": ("small intestine", "small bowel"),
-    "duodenum": ("duodenum", "duodenal tissue"),
-    "jejunum": ("jejunum", "jejunal tissue"),
-    "ileum": ("ileum", "ileal tissue"),
-    "stomach": ("stomach tissue", "stomach", "gastric tissue"),
-    "esophagus": ("esophagus", "oesophagus", "esophageal tissue", "oesophageal tissue"),
-    "prostate": ("prostate tissue", "prostate", "prostatic tissue"),
-    "ovary": ("ovarian tissue", "ovary"),
-    "testis": ("testicular tissue", "testis", "testes"),
-    "placenta": ("placental tissue", "placenta"),
-    "spleen": ("splenic tissue", "spleen"),
-    "thyroid": ("thyroid gland", "thyroid tissue", "thyroid"),
-    "skin": ("skin tissue", "skin", "dermis", "epidermis"),
-    "bone": ("bone tissue", "bone"),
-    "cartilage": ("cartilage", "cartilaginous tissue"),
-    "retina": ("retinal tissue", "retina"),
-    "eye": ("ocular tissue", "eye tissue"),
-    "artery": ("arterial tissue", "artery", "aorta"),
-    "vein": ("venous tissue", "vein"),
-    "lymph node": ("lymph node", "lymph nodes"),
-    "tonsil": ("tonsillar tissue", "tonsil"),
-    "endometrium": ("endometrial tissue", "endometrium"),
-    "uterus": ("uterine tissue", "uterus"),
-    "bladder": ("urinary bladder", "bladder tissue", "bladder"),
-    "gallbladder": ("gallbladder", "gall bladder"),
-    "oral mucosa": ("oral mucosa", "buccal mucosa"),
-    "nasal tissue": ("nasal tissue", "nasal epithelium", "nasal mucosa"),
-    "bronchoalveolar lavage": ("bronchoalveolar lavage", "bal fluid", "balf"),
-    "synovial fluid": ("synovial fluid",),
-    "seminal plasma": ("seminal plasma", "seminal fluid"),
-    "amniotic fluid": ("amniotic fluid",),
-    "cell line": ("cell line", "cell lines"),
-    "primary cells": ("primary cells", "primary cell"),
-    "organoid": ("organoids", "organoid"),
-}
-
-SUPPRESS_BROAD_TISSUES = {
-    "skeletal muscle": {"muscle"},
-    "cardiac muscle": {"muscle", "heart"},
-    "visceral adipose tissue": {"adipose tissue"},
-    "subcutaneous adipose tissue": {"adipose tissue"},
-    "whole blood": {"blood"},
-    "plasma": {"blood"},
-    "pbmc": {"blood"},
-    "pancreatic islet": {"pancreas"},
-    "cerebral cortex": {"brain"},
-    "hippocampus": {"brain"},
-    "cerebellum": {"brain"},
-    "cerebrospinal fluid": {"brain"},
-    "seminal plasma": {"plasma"},
-}
-
-NUMBER_WORDS = {
-    "one": 1,
-    "two": 2,
-    "three": 3,
-    "four": 4,
-    "five": 5,
-    "six": 6,
-    "seven": 7,
-    "eight": 8,
-    "nine": 9,
-    "ten": 10,
-    "eleven": 11,
-    "twelve": 12,
-    "thirteen": 13,
-    "fourteen": 14,
-    "fifteen": 15,
-    "sixteen": 16,
-    "seventeen": 17,
-    "eighteen": 18,
-    "nineteen": 19,
-    "twenty": 20,
-}
-
-NUMBER_TOKEN = r"(?:\d{1,6}|" + "|".join(NUMBER_WORDS) + r")"
-ENTITY_TOKEN = (
-    r"patients?|subjects?|participants?|individuals?|donors?|volunteers?|"
-    r"biological samples?|clinical samples?|samples?|specimens?|biops(?:y|ies)|"
-    r"tissue samples?|tissues?|organs?|biological replicates?|technical replicates?|replicates?"
-)
-
-COUNT_PATTERNS = [
-    re.compile(
-        rf"\b(?P<count>{NUMBER_TOKEN})\s+(?P<entity>{ENTITY_TOKEN})\b",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        rf"\b(?P<entity>{ENTITY_TOKEN})\s+(?:from|of|in|were|was|included|comprised)\s+"
-        rf"(?P<count>{NUMBER_TOKEN})\b",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        rf"\b(?:cohort|group|set|panel)\s+of\s+(?P<count>{NUMBER_TOKEN})\s+"
-        rf"(?P<entity>{ENTITY_TOKEN})\b",
-        re.IGNORECASE,
-    ),
-    re.compile(rf"\bn\s*[=:]\s*(?P<count>{NUMBER_TOKEN})\b", re.IGNORECASE),
 ]
 
 
@@ -526,10 +347,9 @@ def zip_member_records(
     files: list[dict[str, Any]],
     timeout: float,
     max_central_directory_bytes: int,
-) -> tuple[list[dict[str, Any]], list[str]]:
-    """Find targets and filenames in public ZIPs using HTTP ranges only."""
+) -> list[dict[str, Any]]:
+    """Find proteinGroups.txt in public ZIPs using HTTP ranges only."""
     matches: list[dict[str, Any]] = []
-    archived_names: list[str] = []
     for archive in files:
         archive_name = unquote(file_name(archive)).replace("\\", "/")
         if not archive_name.casefold().endswith(".zip"):
@@ -573,8 +393,6 @@ def zip_member_records(
             raw_name = central[position + 46 : position + 46 + name_length]
             encoding = "utf-8" if flags & 0x800 else "cp437"
             member_name = raw_name.decode(encoding, errors="replace").replace("\\", "/")
-            if member_name and not member_name.endswith("/"):
-                archived_names.append(f"{archive_name}!/{member_name}")
             if PurePosixPath(member_name).name == TARGET_FILE:
                 record = dict(archive)
                 record["_archive_file_name"] = archive_name
@@ -589,7 +407,7 @@ def zip_member_records(
                 }
                 matches.append(record)
             position = end
-    return matches, unique(archived_names)
+    return matches
 
 
 def exact_target_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -602,76 +420,32 @@ def exact_target_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return matches
 
 
-def mapping_key(value: str) -> str:
-    """Normalize an LFQ label or submitted filename for conservative matching."""
-    name = unquote(value).replace("\\", "/").rsplit("/", 1)[-1]
-    # Strip common mass-spectrometry and table/archive extensions repeatedly.
-    extensions = {
-        ".raw", ".mzml", ".mzxml", ".wiff", ".wiff2", ".d", ".mgf",
-        ".txt", ".tsv", ".csv", ".zip", ".gz", ".tar",
-    }
-    while True:
-        suffix = PurePosixPath(name).suffix.casefold()
-        if suffix not in extensions:
-            break
-        name = name[: -len(suffix)]
-    return re.sub(r"[^a-z0-9]+", "", name.casefold())
-
-
-def map_lfq_names_to_pride_files(
-    lfq_names: list[str], files: list[dict[str, Any]], archived_names: list[str]
-) -> dict[str, Any]:
-    """Map LFQ column labels to PRIDE manifest basenames by normalized equality."""
-    if not lfq_names:
-        return {
-            "status": "unverified",
-            "mapped_count": "",
-            "unmapped_count": "",
-            "unmapped": [],
-            "matches": [],
-        }
-    index: dict[str, list[str]] = {}
-    submitted_names = [file_name(record) for record in files] + archived_names
-    for submitted_name in submitted_names:
-        display_name = unquote(submitted_name).replace("\\", "/")
-        key = mapping_key(display_name)
-        if key:
-            index.setdefault(key, []).append(display_name)
-
-    matches: list[str] = []
-    unmapped: list[str] = []
-    for label in lfq_names:
-        candidates = unique(index.get(mapping_key(label), []))
-        if candidates:
-            matches.append(f"{label} -> {', '.join(candidates)}")
-        else:
-            unmapped.append(label)
-    mapped_count = len(lfq_names) - len(unmapped)
-    if mapped_count == len(lfq_names):
-        status = "yes"
-    elif mapped_count:
-        status = "partial"
-    else:
-        status = "no"
-    return {
-        "status": status,
-        "mapped_count": mapped_count,
-        "unmapped_count": len(unmapped),
-        "unmapped": unmapped,
-        "matches": matches,
-    }
-
-
 def omicsdi_search(query: str, max_candidates: int, timeout: float) -> list[dict[str, Any]]:
+    """Keep earlier pages if a later request fails, with a coverage warning."""
     results: list[dict[str, Any]] = []
     start = 0
     while len(results) < max_candidates:
         size = min(100, max_candidates - len(results))
-        payload = get_json(
-            OMID_SEARCH,
-            params={"query": query, "start": start, "size": size},
-            timeout=timeout,
-        )
+        try:
+            payload = get_json(
+                OMID_SEARCH,
+                params={"query": query, "start": start, "size": size},
+                timeout=timeout,
+            )
+        except (NetworkError, json.JSONDecodeError) as error:
+            # A later-page error (including HTTP 404) does not invalidate
+            # candidates already retrieved. Do not assume it proves there
+            # are no further results, and do not hide first-page failures.
+            if not results:
+                raise
+            print(
+                f"Warning: OmicsDI pagination failed at start={start}. "
+                f"Keeping {len(results)} candidates already retrieved and "
+                "continuing dataset verification. Search coverage may be "
+                f"incomplete. Details: {error}",
+                file=sys.stderr,
+            )
+            break
         batch = payload.get("datasets") if isinstance(payload, dict) else None
         if not isinstance(batch, list) or not batch:
             break
@@ -816,6 +590,12 @@ def is_target_organism(
             r"\bDanio\s+rerio\b|\bzebra[\s-]?fish\b|\bNCBITaxon\s*:\s*7955\b|"
             r"(?:NCBI\s*)?Taxon(?:omy)?\s*[:=]?\s*7955\b"
         )
+    elif target == "mouse":
+        pattern = (
+            r"\bMus\s+musculus\b|\bmouse\b|\bmice\b|"
+            r"\bNCBITaxon\s*:\s*10090\b|"
+            r"(?:NCBI\s*)?Taxon(?:omy)?\s*[:=]?\s*10090\b"
+        )
     else:  # Protected by argparse choices; retained for direct function use.
         raise ValueError(f"Unsupported organism: {target}")
     return bool(re.search(pattern, text, re.I))
@@ -868,80 +648,27 @@ def fetch_sdrf(accession: str, files: list[dict[str, Any]], timeout: float) -> s
     return ""
 
 
-def parse_sdrf(text: str) -> dict[str, Any]:
-    result = {
-        "row_count": 0,
-        "unique_sources": [],
-        "unique_samples": [],
-        "tissues": [],
-        "organisms": [],
-    }
+def parse_sdrf(text: str) -> dict[str, list[str]]:
+    result: dict[str, list[str]] = {"tissues": [], "organisms": []}
     if not text:
         return result
 
     reader = csv.DictReader(io.StringIO(text.lstrip("\ufeff")), delimiter="\t")
-    if not reader.fieldnames:
-        return result
-
-    source_columns: list[str] = []
-    sample_columns: list[str] = []
-    tissue_columns: list[str] = []
-    organism_columns: list[str] = []
-    for column in reader.fieldnames:
+    columns: dict[str, str] = {}
+    for column in reader.fieldnames or []:
         normalized = re.sub(r"\s+", " ", column.casefold()).strip()
-        if normalized == "source name":
-            source_columns.append(column)
-        if normalized == "sample name":
-            sample_columns.append(column)
         if any(term in normalized for term in ("organism part", "tissue", "body site")):
-            tissue_columns.append(column)
-        if "organism" in normalized and "part" not in normalized:
-            organism_columns.append(column)
+            columns[column] = "tissues"
+        elif "organism" in normalized and "part" not in normalized:
+            columns[column] = "organisms"
 
-    sources: list[str] = []
-    samples: list[str] = []
-    tissues: list[str] = []
-    organisms: list[str] = []
     missing = {"", "not available", "not applicable", "na", "n/a", "unknown"}
     for row in reader:
-        result["row_count"] += 1
-        for column, target in (
-            *((column, sources) for column in source_columns),
-            *((column, samples) for column in sample_columns),
-            *((column, tissues) for column in tissue_columns),
-            *((column, organisms) for column in organism_columns),
-        ):
+        for column, target in columns.items():
             value = clean_text(row.get(column))
             if value.casefold() not in missing:
-                target.append(value)
-
-    result["unique_sources"] = unique(sources)
-    result["unique_samples"] = unique(samples)
-    result["tissues"] = unique(tissues)
-    result["organisms"] = unique(organisms)
-    return result
-
-
-def text_fields(project: dict[str, Any], detail: dict[str, Any]) -> dict[str, str]:
-    pride_values: list[str] = []
-    for key in (
-        "title",
-        "projectTitle",
-        "projectDescription",
-        "description",
-        "sampleProcessingProtocol",
-        "dataProcessingProtocol",
-        "keywords",
-    ):
-        pride_values.extend(flatten_values(project.get(key)))
-
-    omicsdi_values: list[str] = []
-    for key in ("name", "title", "description", "keywords"):
-        omicsdi_values.extend(flatten_values(detail.get(key)))
-    return {
-        "PRIDE metadata": clean_text(" ".join(unique(pride_values))),
-        "OmicsDI metadata": clean_text(" ".join(unique(omicsdi_values))),
-    }
+                result[target].append(value)
+    return {key: unique(values) for key, values in result.items()}
 
 
 def extract_publication_ids(project: dict[str, Any], detail: dict[str, Any]) -> tuple[str, str]:
@@ -992,7 +719,7 @@ def fetch_publication(pmid: str, doi: str, timeout: float) -> dict[str, Any]:
                 params={
                     "query": query,
                     "format": "json",
-                    "resultType": "core",
+                    "resultType": "lite",
                     "pageSize": 1,
                 },
                 timeout=timeout,
@@ -1019,139 +746,20 @@ def publication_link(publication: dict[str, Any], pmid: str, doi: str) -> str:
     return ""
 
 
-def short_snippet(text: str, start: int, end: int, max_words: int = 18) -> str:
-    left = max(text.rfind(".", 0, start), text.rfind(";", 0, start), text.rfind("\n", 0, start))
-    right_candidates = [position for marker in (".", ";", "\n") if (position := text.find(marker, end)) >= 0]
-    right = min(right_candidates) if right_candidates else min(len(text), end + 180)
-    snippet = clean_text(text[left + 1 : right + 1])
-    words = snippet.split()
-    if len(words) > max_words:
-        snippet = " ".join(words[:max_words]) + " …"
-    return snippet
-
-
-def tissue_mentions(text: str, source: str) -> list[dict[str, str]]:
-    found: list[dict[str, str]] = []
-    if not text:
-        return found
-    for canonical, aliases in TISSUE_TERMS.items():
-        best: re.Match[str] | None = None
-        for alias in sorted(aliases, key=len, reverse=True):
-            pattern = re.compile(rf"(?<![A-Za-z0-9]){re.escape(alias)}(?![A-Za-z0-9])", re.I)
-            match = pattern.search(text)
-            if match and (best is None or len(match.group(0)) > len(best.group(0))):
-                best = match
-        if best:
-            found.append(
-                {
-                    "tissue": canonical,
-                    "source": source,
-                    "snippet": short_snippet(text, best.start(), best.end()),
-                }
-            )
-
-    names = {item["tissue"] for item in found}
-    suppress: set[str] = set()
-    for specific, broad_names in SUPPRESS_BROAD_TISSUES.items():
-        if specific in names:
-            suppress.update(broad_names)
-    return [item for item in found if item["tissue"] not in suppress]
-
-
-def number_value(token: str) -> int:
-    token = token.casefold()
-    return int(token) if token.isdigit() else NUMBER_WORDS[token]
-
-
-def normalized_entity(value: str) -> str:
-    text = value.casefold()
-    if "replicate" in text:
-        return "replicates"
-    if text.startswith("patient"):
-        return "patients"
-    if text.startswith("subject"):
-        return "subjects"
-    if text.startswith("participant"):
-        return "participants"
-    if text.startswith("individual"):
-        return "individuals"
-    if text.startswith("donor"):
-        return "donors"
-    if text.startswith("volunteer"):
-        return "volunteers"
-    if "biops" in text:
-        return "biopsies"
-    if text.startswith("specimen"):
-        return "specimens"
-    if "tissue" in text:
-        return "tissues"
-    if text.startswith("organ"):
-        return "organs"
-    return "samples"
-
-
-def count_mentions(text: str, source: str) -> list[dict[str, Any]]:
-    found: list[dict[str, Any]] = []
-    occupied: set[tuple[int, int]] = set()
-    for pattern in COUNT_PATTERNS:
-        for match in pattern.finditer(text or ""):
-            span = match.span()
-            if any(max(span[0], other[0]) < min(span[1], other[1]) for other in occupied):
-                continue
-            occupied.add(span)
-            entity = normalized_entity(match.groupdict().get("entity") or "n")
-            if match.groupdict().get("entity") is None:
-                entity = "unspecified n"
-            found.append(
-                {
-                    "count": number_value(match.group("count")),
-                    "entity": entity,
-                    "source": source,
-                    "snippet": short_snippet(text, match.start(), match.end()),
-                }
-            )
-    deduplicated: dict[tuple[int, str, str], dict[str, Any]] = {}
-    for item in found:
-        key = (item["count"], item["entity"], item["source"])
-        deduplicated.setdefault(key, item)
-    return list(deduplicated.values())
-
-
-def canonicalize_structured_tissues(values: Iterable[str]) -> list[str]:
-    result: list[str] = []
-    for value in values:
-        mentions = tissue_mentions(value, "structured metadata")
-        if mentions:
-            result.extend(item["tissue"] for item in mentions)
-        else:
-            result.append(value)
-    return unique(result)
-
-
-def parse_protein_groups_header(content: bytes) -> dict[str, Any]:
-    result = {"status": "unverified", "lfq_columns": [], "ordinary_intensity_count": ""}
+def parse_protein_groups_header(content: bytes) -> str:
     if b"\n" not in content:
-        return result
+        return "unverified"
     first_line = content.splitlines()[0].decode("utf-8-sig", errors="replace")
-    columns = [column.strip() for column in first_line.split("\t")]
-    lfq_columns = [
-        column for column in columns
-        if re.fullmatch(r"LFQ\s+intensity(?:\s+.+)?", column, flags=re.I)
-    ]
-    ordinary = [
-        column for column in columns
-        if re.fullmatch(r"Intensity\s+.+", column, flags=re.I)
-        and not re.fullmatch(r"LFQ\s+intensity\s+.+", column, flags=re.I)
-    ]
-    result["status"] = "yes" if lfq_columns else "no"
-    result["lfq_columns"] = lfq_columns
-    result["ordinary_intensity_count"] = len(ordinary)
-    return result
+    has_lfq = any(
+        re.fullmatch(r"LFQ\s+intensity(?:\s+.+)?", column.strip(), flags=re.I)
+        for column in first_line.split("\t")
+    )
+    return "yes" if has_lfq else "no"
 
 
-def read_zip_member_header(url: str, member: dict[str, Any], timeout: float) -> dict[str, Any]:
+def read_zip_member_header(url: str, member: dict[str, Any], timeout: float) -> str:
     """Read a ZIP member's first table line without downloading its archive."""
-    result = {"status": "unverified", "lfq_columns": [], "ordinary_intensity_count": ""}
+    result = "unverified"
     local_offset = member.get("local_offset")
     compressed_size = member.get("compressed_size")
     compression = member.get("compression")
@@ -1180,12 +788,8 @@ def read_zip_member_header(url: str, member: dict[str, Any], timeout: float) -> 
     return parse_protein_groups_header(decoded)
 
 
-def read_table_header(url: str, timeout: float, max_bytes: int = 512_000) -> dict[str, Any]:
-    result = {
-        "status": "unverified",
-        "lfq_columns": [],
-        "ordinary_intensity_count": "",
-    }
+def read_table_header(url: str, timeout: float, max_bytes: int = 512_000) -> str:
+    result = "unverified"
     if not url.startswith(("http://", "https://")):
         return result
     try:
@@ -1200,66 +804,13 @@ def read_table_header(url: str, timeout: float, max_bytes: int = 512_000) -> dic
         return result
 
 
-def count_hint_text(items: Iterable[dict[str, Any]]) -> str:
-    values = []
-    for item in items:
-        values.append(
-            f'{item["source"]}: {item["count"]} {item["entity"]} [{item["snippet"]}]'
-        )
-    return " | ".join(unique(values))
-
-
-def choose_sample_estimate(
-    sdrf: dict[str, Any], count_evidence: list[dict[str, Any]]
-) -> tuple[str, str, str]:
-    samples = sdrf.get("unique_samples") or []
-    sources = sdrf.get("unique_sources") or []
-    if samples:
-        return str(len(samples)), "SDRF unique 'sample name' values", "high"
-    if sources:
-        return str(len(sources)), "SDRF unique 'source name' values", "high"
-
-    source_rank = {"PRIDE metadata": 0, "OmicsDI metadata": 1, "publication abstract": 2}
-    entity_rank = {
-        "samples": 0,
-        "specimens": 1,
-        "biopsies": 1,
-        "donors": 2,
-        "patients": 3,
-        "subjects": 3,
-        "participants": 3,
-        "individuals": 3,
-        "volunteers": 3,
-        "tissues": 4,
-        "organs": 4,
-        "unspecified n": 9,
-    }
-    candidates = [item for item in count_evidence if item["entity"] != "replicates"]
-    if not candidates:
-        return "", "", ""
-    candidates.sort(
-        key=lambda item: (
-            source_rank.get(item["source"], 9),
-            entity_rank.get(item["entity"], 8),
-        )
-    )
-    best = candidates[0]
-    confidence = "medium" if best["source"] == "PRIDE metadata" and best["entity"] != "unspecified n" else "low"
-    return (
-        str(best["count"]),
-        f'{best["source"]}: explicit {best["entity"]} statement',
-        confidence,
-    )
-
-
 def process_candidate(item: dict[str, Any], args: argparse.Namespace) -> dict[str, Any] | None:
     accession = clean_text(item.get("id") or item.get("accession")).upper()
     try:
         files = pride_files(accession, args.timeout)
         targets = exact_target_files(files)
-        archived_names: list[str] = []
         if args.inspect_zip_archives:
-            zipped_targets, archived_names = zip_member_records(
+            zipped_targets = zip_member_records(
                 accession,
                 files,
                 args.timeout,
@@ -1282,12 +833,12 @@ def process_candidate(item: dict[str, Any], args: argparse.Namespace) -> dict[st
 
         target_urls = [direct_file_url(accession, record) for record in targets]
         if args.skip_header_check:
-            header = {"status": "unverified", "lfq_columns": [], "ordinary_intensity_count": ""}
+            header = "unverified"
         elif targets[0].get("_zip_member"):
             header = read_zip_member_header(target_urls[0], targets[0]["_zip_member"], args.timeout)
         else:
             header = read_table_header(target_urls[0], args.timeout)
-        if args.require_lfq_columns and header["status"] != "yes":
+        if args.require_lfq_columns and header != "yes":
             return None
 
         pmid, doi = extract_publication_ids(project, detail)
@@ -1295,37 +846,10 @@ def process_candidate(item: dict[str, Any], args: argparse.Namespace) -> dict[st
         pmid = clean_text(publication.get("pmid") or pmid)
         doi = clean_text(publication.get("doi") or doi)
 
-        sources = text_fields(project, detail)
-        abstract = clean_text(publication.get("abstractText"))
-        if abstract:
-            sources["publication abstract"] = abstract
-
-        tissue_evidence: list[dict[str, str]] = []
-        count_evidence: list[dict[str, Any]] = []
-        for source, text in sources.items():
-            tissue_evidence.extend(tissue_mentions(text, source))
-            count_evidence.extend(count_mentions(text, source))
-
         pride_tissues = structured_tissues_from_pride(project)
         omicsdi_tissues = structured_tissues_from_omicsdi(detail)
-        sdrf_tissues = list(sdrf.get("tissues") or [])
-        mined_tissues = unique(item["tissue"] for item in tissue_evidence)
-        combined_tissues = unique(
-            canonicalize_structured_tissues(pride_tissues + omicsdi_tissues + sdrf_tissues)
-            + mined_tissues
-        )
-
-        sample_counts = [item for item in count_evidence if item["entity"] != "replicates"]
-        replicate_counts = [item for item in count_evidence if item["entity"] == "replicates"]
-        estimate, basis, confidence = choose_sample_estimate(sdrf, count_evidence)
-
-        lfq_columns: list[str] = list(header["lfq_columns"])
-        lfq_names = [
-            re.sub(r"^LFQ\s+intensity\s*", "", column, flags=re.I).strip()
-            for column in lfq_columns
-        ]
-        lfq_names = [name for name in lfq_names if name]
-        lfq_mapping = map_lfq_names_to_pride_files(lfq_names, files, archived_names)
+        sdrf_tissues = sdrf["tissues"]
+        combined_tissues = unique(pride_tissues + omicsdi_tissues + sdrf_tissues)
 
         categories = unique(file_category(record) for record in targets)
         sizes = []
@@ -1359,17 +883,6 @@ def process_candidate(item: dict[str, Any], args: argparse.Namespace) -> dict[st
             or detail.get("name")
         )
 
-        pride_sample_evidence = [
-            evidence["snippet"]
-            for evidence in count_evidence
-            if evidence["source"] == "PRIDE metadata"
-        ]
-        abstract_sample_evidence = [
-            evidence["snippet"]
-            for evidence in count_evidence
-            if evidence["source"] == "publication abstract"
-        ]
-
         return {
             "accession": accession,
             "title": title,
@@ -1389,34 +902,11 @@ def process_candidate(item: dict[str, Any], args: argparse.Namespace) -> dict[st
             "protein_groups_file_category": "; ".join(categories),
             "protein_groups_file_size_mb": "; ".join(sizes),
             "protein_groups_url": "; ".join(target_urls),
-            "lfq_columns_detected": header["status"],
-            "lfq_column_count": len(lfq_columns) if header["status"] != "unverified" else "",
-            "lfq_sample_names": "; ".join(lfq_names),
-            "lfq_names_mappable_to_pride_files": lfq_mapping["status"],
-            "lfq_names_mapped_count": lfq_mapping["mapped_count"],
-            "lfq_names_unmapped_count": lfq_mapping["unmapped_count"],
-            "lfq_names_unmapped": "; ".join(lfq_mapping["unmapped"]),
-            "lfq_name_file_matches": " | ".join(lfq_mapping["matches"]),
-            "ordinary_intensity_column_count": header["ordinary_intensity_count"],
+            "lfq_columns_detected": header,
             "pride_structured_tissues": "; ".join(pride_tissues),
             "omicsdi_structured_tissues": "; ".join(omicsdi_tissues),
             "sdrf_tissues": "; ".join(sdrf_tissues),
-            "text_mined_tissues": "; ".join(mined_tissues),
             "combined_tissues": "; ".join(combined_tissues),
-            "tissue_count": len(combined_tissues),
-            "sdrf_row_count": sdrf["row_count"] or "",
-            "sdrf_unique_source_count": len(sdrf["unique_sources"]) or "",
-            "sdrf_unique_sample_count": len(sdrf["unique_samples"]) or "",
-            "sample_count_estimate": estimate,
-            "sample_count_basis": basis,
-            "sample_count_confidence": confidence,
-            "sample_count_hints": count_hint_text(sample_counts),
-            "replicate_count_hints": count_hint_text(replicate_counts),
-            "sample_evidence_pride": " | ".join(unique(pride_sample_evidence)),
-            "sample_evidence_abstract": " | ".join(unique(abstract_sample_evidence)),
-            "tissue_evidence_sources": "; ".join(
-                unique(f'{evidence["tissue"]} [{evidence["source"]}]' for evidence in tissue_evidence)
-            ),
             "pmid": pmid,
             "doi": doi,
             "publication_title": clean_text(publication.get("title")),
@@ -1481,8 +971,8 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Discover human or zebrafish PRIDE proteomics datasets through OmicsDI, require an exact "
-            "proteinGroups.txt file (directly or inside ZIP), and extract tissue/sample evidence."
+            "Discover human, mouse, or zebrafish PRIDE proteomics datasets through OmicsDI, require an exact "
+            "proteinGroups.txt file (directly or inside ZIP), and report structured metadata and related study links."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -1495,8 +985,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("human_proteingroups_report.csv"),
-        help="Final CSV report.",
+        default=None,
+        help="Final CSV report; if omitted, uses <organism>_proteingroups_report.csv.",
     )
     parser.add_argument(
         "--max-candidates",
@@ -1551,7 +1041,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--skip-publications",
         action="store_true",
-        help="Skip Europe PMC publication lookup and abstract text mining.",
+        help="Skip Europe PMC title lookup; keep publication identifiers and links from metadata.",
     )
     parser.add_argument(
         "--allow-unconfirmed-organism",
@@ -1572,7 +1062,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0.15,
         help="Polite delay in seconds between worker batches.",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.output is None:
+        args.output = Path(f"{args.organism}_proteingroups_report.csv")
+    return args
 
 
 def validate_args(args: argparse.Namespace) -> None:
