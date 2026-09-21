@@ -12,7 +12,7 @@ selected_features/
 *.xlsx
 *.csv
 f_model_training.py
-intellaif_AI_1d_final_80model_240epochs.py
+sample_script.py
 
 
 # Byte-compiled / optimized / DLL files
