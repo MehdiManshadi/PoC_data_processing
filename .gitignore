@@ -11,8 +11,8 @@ selected_features/
 *.gz
 *.xlsx
 *.csv
-f_model_training.py
-sample_script.py
+f_dataset_assignment.py
+g_model_*
 
 
 # Byte-compiled / optimized / DLL files

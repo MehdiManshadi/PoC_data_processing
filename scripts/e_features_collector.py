@@ -4,13 +4,46 @@ import numpy as np
 import pandas as pd
 
 
+MISSING_VALUE_POLICIES = ("zero", "min_minus_one", "neg_log_median")
+
+
+def _missing_value_floor(missing_value_policy, centered_real, medians):
+    """Return the floor value used for zero/missing measurements, and for
+    genes with no mapped protein at all, under missing_value_policy:
+
+    - "zero": missing/zero measurements are simply 0.
+    - "min_minus_one": one unit below the minimum centered value actually
+      observed among real (nonzero, non-missing) measurements in that column.
+    - "neg_log_median": -log2(median + 1) — the value a raw zero would get
+      under ordinary log2(x+1) centering against the median.
+    """
+    if missing_value_policy == "zero":
+        return 0
+    if missing_value_policy == "min_minus_one":
+        return centered_real.min(skipna=True) - 1
+    if missing_value_policy == "neg_log_median":
+        return -medians
+    raise ValueError(
+        f"Unknown missing_value_policy: {missing_value_policy!r}; "
+        f"expected one of {MISSING_VALUE_POLICIES}"
+    )
+
+
 def collect_features(
-    features_file, data_folder, mapping_file, ortholog_files, output_file=None
+    features_file,
+    data_folder,
+    mapping_file,
+    ortholog_files,
+    output_file=None,
+    missing_value_policy="zero",
 ):
     """Process all CSVs in data_folder and save their columns in one CSV.
 
     Rows follow features_file order. Output includes feature and sample names.
     Returns the combined DataFrame. Files are processed in filename order.
+    missing_value_policy selects how zero/missing measurements (and genes
+    with no mapped protein at all) are represented — see
+    MISSING_VALUE_POLICIES / _missing_value_floor.
     """
     with open(features_file, encoding="utf-8") as file:
         features = file.read().splitlines()
@@ -45,7 +78,9 @@ def collect_features(
         ortholog_maps[dataset_type] = ortholog_map
 
     processed = [
-        _process_data_file(features, file_path, gene_protein_map, ortholog_maps)
+        _process_data_file(
+            features, file_path, gene_protein_map, ortholog_maps, missing_value_policy
+        )
         for file_path in data_files
     ]
     combined = pd.concat(processed, axis=1)
@@ -55,7 +90,9 @@ def collect_features(
     return combined
 
 
-def _process_data_file(features, file_path, gene_protein_map, ortholog_maps):
+def _process_data_file(
+    features, file_path, gene_protein_map, ortholog_maps, missing_value_policy
+):
     """Normalize one dataset and aggregate mapped proteins to genes by median."""
     prefix = file_path.stem
 
@@ -71,16 +108,24 @@ def _process_data_file(features, file_path, gene_protein_map, ortholog_maps):
             if str(col).startswith(prefix)
         ]
         measurements = df[matching_columns].apply(pd.to_numeric, errors="coerce")
-        log2_measurements = np.log2(measurements.where(measurements.ne(0)))
-        medians = log2_measurements.median(skipna=True)
-        normalized = log2_measurements.subtract(medians, axis="columns").mask(
-            measurements.eq(0), 0
-        )
+        # Real, actually measured values (nonzero, non-missing) are centered
+        # with a log2(x+1) pseudocount against their own column median.
+        real_mask = measurements.ne(0) & measurements.notna()
+        log2_real = np.log2(measurements.where(real_mask) + 1)
+        medians = log2_real.median(skipna=True)
+        centered_real = log2_real.subtract(medians, axis="columns")
+
+        # Missing-value / zero policy, isolated so it can be revisited on its
+        # own later.
+        floor_value = _missing_value_floor(missing_value_policy, centered_real, medians)
+        normalized = centered_real.fillna(floor_value)
         return (
             normalized.assign(**{"Gene name": df["Gene name"]})
             .groupby("Gene name")[matching_columns]
             .median()
             .reindex(features)
+            # A gene absent from this file entirely is also assumed zero.
+            .fillna(floor_value)
             .reset_index(drop=True)
         )
 
@@ -108,15 +153,17 @@ def _process_data_file(features, file_path, gene_protein_map, ortholog_maps):
     # Convert nonnumeric entries to NaN before computing log2 intensities.
     measurements = LFQ[matching_columns].apply(pd.to_numeric, errors="coerce")
 
-    # Temporarily treat original zeros as missing so they do not enter the log2 median.
-    log2_measurements = np.log2(measurements.where(measurements.ne(0)))
-    # Calculate one median per sample column, ignoring NaN values.
-    medians = log2_measurements.median(skipna=True)
-    # Subtract each column's median, then restore only the original zero positions.
-    # Missing values remain NaN; normalized nonzero measurements may also equal zero.
-    LFQ[matching_columns] = log2_measurements.subtract(medians, axis="columns").mask(
-        measurements.eq(0), 0
-    )
+    # Real, actually measured values (nonzero, non-missing) are centered with
+    # a log2(x+1) pseudocount against their own column median.
+    real_mask = measurements.ne(0) & measurements.notna()
+    log2_real = np.log2(measurements.where(real_mask) + 1)
+    medians = log2_real.median(skipna=True)
+    centered_real = log2_real.subtract(medians, axis="columns")
+
+    # Missing-value / zero policy, isolated so it can be revisited on its own
+    # later.
+    floor_value = _missing_value_floor(missing_value_policy, centered_real, medians)
+    LFQ[matching_columns] = centered_real.fillna(floor_value)
     # Optional inspection: print a protein's normalized measurements or sample medians.
     # print(LFQ.loc[LFQ["Protein IDs"] == "A0AVI4", matching_columns])
     # print(medians)
@@ -162,11 +209,12 @@ def _process_data_file(features, file_path, gene_protein_map, ortholog_maps):
         group_column = "From"
 
     # Aggregate all mapped proteins per gene, preserving the requested gene order.
-    # Unmatched genes retain NaN; original zeros are included in the median.
+    # A gene with no mapped protein at all in this file is also assumed zero.
     feature_measurements = (
         protein_measurements.groupby(group_column)[matching_columns]
         .median()
         .reindex(features)
+        .fillna(floor_value)
         # Remove feature labels only after establishing the feature-file row order.
         .reset_index(drop=True)
     )
@@ -177,7 +225,7 @@ def _process_data_file(features, file_path, gene_protein_map, ortholog_maps):
 if __name__ == "__main__":
     collect_features(
         features_file=(
-            "/Users/mehman/3-IntellAif/zebrafish POC/Integrated_features.txt"
+            "/Users/mehman/Projects/PoC_data_processing/selected_features/Integrated_features.txt"
         ),
         mapping_file=(
             "/Users/mehman/Projects/PoC_data_processing/"
@@ -197,4 +245,5 @@ if __name__ == "__main__":
                 "combined_features_mouse_orthologs.csv"
             ),
         },
+        missing_value_policy="min_minus_one",
     )
