@@ -11,7 +11,6 @@ selected_features/
 *.gz
 *.xlsx
 *.csv
-f_dataset_assignment.py
 g_model_*
 
 
